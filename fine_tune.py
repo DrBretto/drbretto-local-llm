@@ -1,54 +1,73 @@
-import torch
+import json
 from transformers import GPTNeoForCausalLM, GPT2Tokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, DatasetDict
-from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
+import torch
 
-# Assuming your dataset is in a CSV file named 'dataset.csv' with columns 'article' and 'score'
-dataset_path = 'path/to/your/dataset.csv'  # Update this path
+# Load the JSON data
+with open('data/sentiment_score/sentiment_scores.json', 'r') as file:
+    data = json.load(file)
 
-# Load the dataset
-raw_datasets = load_dataset('csv', data_files=dataset_path, split='train')
-raw_datasets = raw_datasets.train_test_split(test_size=0.1)  # Splitting the dataset
+# Split the data into training and validation
+train_data = data[:int(len(data) * 0.8)]
+val_data = data[int(len(data) * 0.8):]
 
-# Tokenization function
-def tokenize_function(examples):
-    return tokenizer(examples['article'], padding="max_length", truncation=True)
+# Define a custom dataset class
+class ArticleDataset(Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
 
-# Load tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-125M")  # Adjust model size as needed
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor([self.labels[idx]])  # Model expects labels to be a tensor
+        return item
 
-# Tokenize the dataset
-tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
+    def __len__(self):
+        return len(self.labels)
 
-# Load the model
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").to("cuda")  # Adjust model size as needed
+# Load tokenizer and tokenize the articles
+tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
+tokenizer.pad_token = tokenizer.eos_token  # Set padding token
+
+# Tokenize articles
+train_encodings = tokenizer([item['article'] for item in train_data], truncation=True, padding=True, return_tensors="pt")
+val_encodings = tokenizer([item['article'] for item in val_data], truncation=True, padding=True, return_tensors="pt")
+
+# Prepare the datasets
+train_labels = [item['score'] for item in train_data]  # Scores are already in the correct format
+val_labels = [item['score'] for item in val_data]
+
+train_dataset = ArticleDataset(train_encodings, train_labels)
+val_dataset = ArticleDataset(val_encodings, val_labels)
+
+# Load model
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M")
+model.to('cuda')  # If you're using a GPU
 
 # Define training arguments
 training_args = TrainingArguments(
     output_dir="./results",
-    evaluation_strategy="epoch",
-    learning_rate=2e-5,
-    weight_decay=0.01,
-    per_device_train_batch_size=4,  # Adjust based on your GPU memory
-    per_device_eval_batch_size=4,
-    num_train_epochs=3,  # Adjust as needed
+    num_train_epochs=3,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
     warmup_steps=500,
-    save_strategy="epoch",
-    load_best_model_at_end=True,
+    weight_decay=0.01,
+    logging_dir='./logs',
+    logging_steps=10,
 )
 
-# Initialize Trainer
+# Initialize the Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["test"],
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
     tokenizer=tokenizer,
 )
 
 # Start training
 trainer.train()
 
-# Save the model
+# Save the trained model and tokenizer
 model.save_pretrained("./your_model_directory")
 tokenizer.save_pretrained("./your_model_directory")
